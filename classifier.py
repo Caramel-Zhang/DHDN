@@ -10,28 +10,22 @@ import random
 import umap.umap_ as umap
 from data_utilities import *
 
-# Set non-interactive Matplotlib backend
 plt.switch_backend('Agg')
 plt.rcParams['figure.dpi'] = 100
 
-# Suppress TensorFlow warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-# Set random seeds for reproducibility
 random.seed(4)
 np.random.seed(4)
 tf.random.set_seed(2)
 os.environ['TF_DETERMINISTIC_OPS'] = '1'
 os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
 
-# GPU settings
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = '1'
 
-# Check GPU availability
 print(tf.config.list_physical_devices('GPU'))
 
-# Load dataset
 dataset_name = 'ManySig'
 dataset_path = './'
 compact_dataset = load_compact_pkl_dataset(dataset_path, dataset_name)
@@ -39,19 +33,18 @@ tx_list = compact_dataset['tx_list']
 rx_list = compact_dataset['rx_list']
 capture_date_list = compact_dataset['capture_date_list']
 n_rx = len(rx_list)
-n_tx = len(tx_list)  # Train on all 6 classes
-unknown_tx_idx = len(tx_list) - 1  # Last class is OOD
+n_tx = len(tx_list)
+unknown_tx_idx = len(tx_list) - 1
 known_tx_list = tx_list[:-1]
+n_id_classes = len(known_tx_list)
 print(f"Number of TX: {n_tx}, RX: {n_rx}, OOD TX: {tx_list[unknown_tx_idx]}")
 
+prototypes = [tf.Variable(tf.random.normal([128], stddev=0.01), trainable=False, name=f'proto_{i}') for i in range(n_id_classes)]
+mean_energies = [tf.Variable(tf.zeros([]), trainable=False, name=f'mu_{i}') for i in range(n_id_classes)]
+alpha = tf.Variable(0.5, trainable=True, name='alpha')
+momentum = 0.9
 
-# Function to add 0 dB Gaussian noise
 def add_0db_noise(signals):
-    """
-    Add Gaussian noise to signals to achieve 0 dB SNR.
-    signals: numpy array of shape (n_samples, 256, 2) [real, imag]
-    Returns: signals with added noise
-    """
     noisy_signals = signals.copy()
     n_samples = signals.shape[0]
 
@@ -62,8 +55,109 @@ def add_0db_noise(signals):
 
     return noisy_signals
 
+class ChannelWiseShrinkage(layers.Layer):
+    def __init__(self, **kwargs):
+        super(ChannelWiseShrinkage, self).__init__(**kwargs)
 
-# UMAP visualization function
+    def build(self, input_shape):
+        self.thresholds = self.add_weight(
+            shape=(input_shape[-1],),
+            initializer='zeros',
+            trainable=True,
+            name='thresholds'
+        )
+        super(ChannelWiseShrinkage, self).build(input_shape)
+
+    def call(self, inputs):
+        abs_x = tf.abs(inputs)
+        threshold = tf.nn.softplus(self.thresholds)
+        mask = tf.cast(abs_x > threshold, tf.float32)
+        shrunk = inputs * (1.0 - threshold / (abs_x + 1e-8)) * mask
+        return shrunk
+
+def rsbu_cw(filters, kernel_size=3, strides=1, projection=True):
+    def rsbu_cw_block(inputs):
+        shortcut = inputs
+
+        x = layers.Conv1D(filters, kernel_size, strides=strides, padding='same')(inputs)
+        x = layers.BatchNormalization()(x)
+        x = layers.ReLU()(x)
+
+        x = layers.Conv1D(filters, kernel_size, strides=1, padding='same')(x)
+        x = layers.BatchNormalization()(x)
+
+        x = ChannelWiseShrinkage()(x)
+
+        if projection and strides != 1:
+            shortcut = layers.Conv1D(filters, 1, strides=strides, padding='same')(shortcut)
+            shortcut = layers.BatchNormalization()(shortcut)
+        elif inputs.shape[-1] != filters:
+            shortcut = layers.Conv1D(filters, 1, strides=1, padding='same')(shortcut)
+            shortcut = layers.BatchNormalization()(shortcut)
+
+        x = layers.Add()([x, shortcut])
+        x = layers.ReLU()(x)
+
+        return x
+    return rsbu_cw_block
+
+def create_cnn_model(n_tx):
+    input_signal = layers.Input(shape=(256, 2), name='signal_input')
+    x = layers.Reshape((512, 1))(input_signal)
+
+    x = layers.Conv1D(64, 3, strides=2, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+
+    x = rsbu_cw(16, strides=2)(x)
+    x = rsbu_cw(32, strides=1)(x)
+    x = rsbu_cw(64, strides=2)(x)
+    x = rsbu_cw(128, strides=1)(x)
+
+    x = layers.GlobalAveragePooling1D()(x)
+    feature_layer = layers.Lambda(lambda t: tf.expand_dims(t, axis=-1), name='feature_layer')(x)
+
+    output = layers.Dense(n_tx, activation='softmax', name='classification_output')(x)
+
+    model = Model(inputs=input_signal, outputs=output)
+    return model
+
+class AdaptiveEnergyLoss(keras.losses.Loss):
+    def __init__(self, lambda_ae=0.5, **kwargs):
+        super().__init__(**kwargs)
+        self.lambda_ae = lambda_ae
+        self.ce_loss = keras.losses.CategoricalCrossentropy()
+
+    def call(self, y_true, y_pred):
+        logits = tf.math.log(tf.clip_by_value(y_pred, 1e-12, 1.0 - 1e-12))
+
+        labels = tf.argmax(y_true, axis=1)
+        is_id = tf.cast(tf.not_equal(labels, unknown_tx_idx), tf.float32)
+        is_ood = 1.0 - is_id
+
+        ce = self.ce_loss(y_true, y_pred)
+
+        energy = -tf.math.reduce_logsumexp(logits, axis=1)
+
+        print("Warning: Full adaptive prototype update requires custom training loop. Using fixed margins as fallback.")
+        m_in = -1.0
+        m_out = -5.0
+        ae_loss = tf.reduce_mean(tf.nn.relu(energy * is_id - m_in) + tf.nn.relu(m_out - energy * is_ood))
+
+        total_loss = ce + self.lambda_ae * ae_loss
+        return total_loss
+
+class EMAUpdateCallback(keras.callbacks.Callback):
+    def __init__(self, feature_model, prototypes, mean_energies, momentum=0.9):
+        super().__init__()
+        self.feature_model = feature_model
+        self.prototypes = prototypes
+        self.mean_energies = mean_energies
+        self.momentum = momentum
+
+    def on_batch_end(self, batch, logs=None):
+        pass
+
 def visualize_umap(features, labels, title="UMAP Visualization", filename=None, classes=None):
     try:
         if np.isnan(features).any() or np.isinf(features).any():
@@ -95,91 +189,6 @@ def visualize_umap(features, labels, title="UMAP Visualization", filename=None, 
         print(f"Error saving UMAP plot to {filename}: {e}")
         plt.close()
 
-
-# Create enhanced CNN model with residual connections
-def create_cnn_model(n_tx):
-    input_signal = layers.Input(shape=(256, 2), name='signal_input')
-    x = layers.Permute((2, 1))(input_signal)
-    x = layers.Reshape((512, 1))(x)
-
-    shortcut_input = x
-
-    x = layers.Conv1D(128, 3, strides=1, padding='same', activation='relu')(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Conv1D(128, 3, strides=2, padding='same', activation='relu')(x)
-    x = layers.BatchNormalization()(x)
-    shortcut = layers.Conv1D(128, 1, strides=2, padding='same')(shortcut_input)
-    shortcut = layers.BatchNormalization()(shortcut)
-    x = layers.Add()([x, shortcut])
-
-    shortcut_input = x
-
-    x = layers.Conv1D(32, 3, strides=1, padding='same', activation='relu')(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Conv1D(32, 3, strides=2, padding='same', activation='relu')(x)
-    x = layers.BatchNormalization()(x)
-    shortcut = layers.Conv1D(32, 1, strides=2, padding='same')(shortcut_input)
-    shortcut = layers.BatchNormalization()(shortcut)
-    x = layers.Add()([x, shortcut])
-
-    x = layers.Conv1D(16, 3, strides=1, padding='same', activation='relu')(x)
-    x = layers.BatchNormalization()(x)
-    x = layers.Conv1D(16, 3, strides=2, padding='same', activation='relu')(x)
-    x = layers.BatchNormalization()(x)
-
-    x = layers.GlobalAveragePooling1D()(x)
-    feature_layer = layers.Dense(256, activation='relu', kernel_regularizer=keras.regularizers.l2(0.01),
-                                 name='feature_layer')(x)
-    x = layers.Dropout(0.4)(feature_layer)
-    output = layers.Dense(n_tx, activation='softmax', name='classification_output')(x)
-
-    model = Model(inputs=input_signal, outputs=output)
-    return model
-
-
-# Custom CE + OE loss function
-# Custom CE + EnergyOE loss function
-def ce_oe_loss(y_true, y_pred):
-    """
-    Cross-Entropy loss for known classes +
-    Energy-based OE loss for OOD samples.
-    """
-    # logits before softmax
-    logits = cnn_model.get_layer("classification_output").output  # only works if we pass logits
-    # but here we only get y_pred (softmax), so need trick:
-    # => compute logits via inverse softmax (safe with log)
-    eps = 1e-12
-    logits = tf.math.log(tf.clip_by_value(y_pred, eps, 1.0))  # approximate logits
-
-    # Known / OOD mask
-    labels = tf.argmax(y_true, axis=1)
-    is_known = tf.cast(tf.not_equal(labels, unknown_tx_idx), tf.float32)
-
-    # Cross-entropy loss (only for known)
-    ce_loss = tf.keras.losses.categorical_crossentropy(y_true, y_pred) * is_known
-
-    # Energy function
-    T = 1.0
-    energy = -T * tf.math.reduce_logsumexp(logits / T, axis=1)
-
-    # Margin-based energy OE loss
-    m_in, m_out = -1.0, -5.0   # margins (hyperparams)
-    lambda_oe = 0.1
-
-    energy_in = energy * is_known
-    energy_out = energy * (1.0 - is_known)
-
-    loss_in = tf.nn.relu(energy_in - m_in)
-    loss_out = tf.nn.relu(m_out - energy_out)
-
-    oe_loss = tf.reduce_mean(loss_in + loss_out)
-
-    total_loss = tf.reduce_mean(ce_loss) + lambda_oe * oe_loss
-    return total_loss
-
-
-
-# Confusion matrix visualization function
 def visualize_confusion_matrix(y_true, y_pred, classes, title="Confusion Matrix", filename=None):
     try:
         cm = confusion_matrix(y_true, y_pred)
@@ -199,8 +208,6 @@ def visualize_confusion_matrix(y_true, y_pred, classes, title="Confusion Matrix"
         print(f"Error saving confusion matrix to {filename}: {e}")
         plt.close()
 
-
-# Main training and testing loop
 TRAIN = True
 nreal = 1
 sig_len_list = [20]
@@ -210,7 +217,6 @@ batch_size = 16
 os.makedirs('weights1', exist_ok=True)
 np.random.seed(9)
 
-# Data preparation
 dataset = merge_compact_dataset(compact_dataset, capture_date_list,
                                 tx_list, rx_list,
                                 max_sig=sig_len_list[0] + 100, equalized=0)
@@ -224,13 +230,11 @@ train_augset, val_augset, test_augset_smRx = prepare_dataset(
 [sig_valid, txidNum_valid, txid_valid, _] = val_augset
 [sig_smTest, txidNum_smTest, txid_smTest, _] = test_augset_smRx
 
-# Add 0 dB noise to the signals
 print("Adding 0 dB Gaussian noise to training, validation, and test sets...")
 sig_train = add_0db_noise(sig_train)
 sig_valid = add_0db_noise(sig_valid)
 sig_smTest = add_0db_noise(sig_smTest)
 
-# Verify number of classes
 train_classes = np.unique(txidNum_train)
 valid_classes = np.unique(txidNum_valid)
 test_classes = np.unique(txidNum_smTest)
@@ -241,21 +245,19 @@ print(f"Train classes: {train_classes}")
 print(f"Valid classes: {valid_classes}")
 print(f"Test classes: {test_classes}")
 
-# Verify class distribution
 print(f"Train class counts: {np.sum(txid_train, axis=0)}")
 print(f"Valid class counts: {np.sum(txid_valid, axis=0)}")
 print(f"Test class counts: {np.sum(txid_smTest, axis=0)}")
 
-# Multiple trials
 for tt in range(nreal):
     print(f"\n{'-' * 20}\nTrial: {tt + 1}\n{'-' * 20}")
     fname_w = f'weights1/cnn_trial_{tt + 1}.h5'
 
-    # Create and train model
     cnn_model = create_cnn_model(n_tx)
+    loss_fn = AdaptiveEnergyLoss(lambda_ae=0.5)
     cnn_model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=0.0003),
-        loss=ce_oe_loss,
+        loss=loss_fn,
         metrics=['categorical_accuracy']
     )
 
@@ -271,7 +273,7 @@ for tt in range(nreal):
                 monitor='val_categorical_accuracy',
                 patience=patience,
                 mode='max'
-            )
+            ),
         ]
 
         history = cnn_model.fit(
@@ -284,7 +286,6 @@ for tt in range(nreal):
             verbose=1
         )
 
-        # Save accuracy plot
         try:
             plt.plot(history.history['categorical_accuracy'], label='Train Accuracy')
             plt.plot(history.history['val_categorical_accuracy'], label='Val Accuracy')
@@ -301,36 +302,31 @@ for tt in range(nreal):
             print(f"Error saving accuracy plot to {accuracy_plot_file}: {e}")
             plt.close()
 
-        # Load best weights
         cnn_model.load_weights(fname_w)
 
-    # Create feature extraction model
     feature_model = Model(
         inputs=cnn_model.input,
-        outputs=cnn_model.get_layer('feature_layer').output
+        outputs=cnn_model.get_layer('feature_layer').output[:, :, 0]
     )
 
-    # Create model for closed-set evaluation (5 classes)
-    closed_set_output = layers.Dense(n_tx - 1, activation='softmax', name='closed_set_output')(
-        cnn_model.get_layer('feature_layer').output)
+    closed_set_features = cnn_model.get_layer('feature_layer').output[:, :, 0]
+    closed_set_output = layers.Dense(n_id_classes, activation='softmax', name='closed_set_output')(closed_set_features)
     closed_set_model = Model(inputs=cnn_model.input, outputs=closed_set_output)
     closed_set_model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=0.0003),
         loss='categorical_crossentropy',
         metrics=['categorical_accuracy']
     )
-    # Copy weights from the main model
     for layer in closed_set_model.layers[:-1]:
-        layer.set_weights(cnn_model.get_layer(layer.name).get_weights())
+        if layer.name in [l.name for l in cnn_model.layers]:
+            layer.set_weights(cnn_model.get_layer(layer.name).get_weights())
 
-    # Test: Evaluate test set
     print(f"\nTesting on test set (Trial {tt + 1})...")
     test_features = feature_model.predict(sig_smTest, batch_size=batch_size, verbose=0)
     test_pred = cnn_model.predict(sig_smTest, batch_size=batch_size, verbose=0)
     test_pred_labels = np.argmax(test_pred, axis=1)
     test_labels = np.argmax(txid_smTest, axis=1)
 
-    # Handle OOD class with confidence threshold
     confidence_threshold = 0.9
     test_pred_confidences = np.max(test_pred, axis=1)
     test_pred_labels_with_ood = test_pred_labels.copy()
@@ -338,23 +334,23 @@ for tt in range(nreal):
     test_labels_with_ood = test_labels.copy()
     test_labels_with_ood[test_labels == unknown_tx_idx] = unknown_tx_idx
 
-    # Evaluate accuracy on known classes only
     known_mask = test_labels != unknown_tx_idx
     if np.any(known_mask):
-        txid_smTest_known = txid_smTest[known_mask][:, :n_tx - 1]  # Shape: (n_known_samples, 5)
+        txid_smTest_known = np.zeros((np.sum(known_mask), n_id_classes))
+        for i, true_label in enumerate(test_labels[known_mask]):
+            if true_label < unknown_tx_idx:
+                txid_smTest_known[i, true_label] = 1
         known_test_accuracy = \
         closed_set_model.evaluate(sig_smTest[known_mask], txid_smTest_known, batch_size=batch_size, verbose=0)[1]
         print(f"Test set accuracy (known classes only): {known_test_accuracy:.4f}")
     else:
         print("No known class samples in test set.")
 
-    # Compute precision and recall for all classes
-    precision = precision_score(test_labels_with_ood, test_pred_labels_with_ood, average=None)
-    recall = recall_score(test_labels_with_ood, test_pred_labels_with_ood, average=None)
+    precision = precision_score(test_labels_with_ood, test_pred_labels_with_ood, average=None, zero_division=0)
+    recall = recall_score(test_labels_with_ood, test_pred_labels_with_ood, average=None, zero_division=0)
     for i, cls in enumerate(known_tx_list + ['OOD']):
         print(f"Class {cls} - Precision: {precision[i]:.4f}, Recall: {recall[i]:.4f}")
 
-    # Save UMAP for test set
     visualize_umap(
         test_features, test_labels_with_ood,
         title=f"Test Set UMAP with OOD Class (Trial {tt})",
@@ -362,7 +358,6 @@ for tt in range(nreal):
         classes=known_tx_list + ['OOD']
     )
 
-    # Save confusion matrix for test set
     visualize_confusion_matrix(
         test_labels_with_ood, test_pred_labels_with_ood,
         classes=known_tx_list + ['OOD'],
@@ -370,5 +365,4 @@ for tt in range(nreal):
         filename=f'weights1/confusion_trial_{tt }.png'
     )
 
-    # Clear session to free memory
     tf.keras.backend.clear_session()
